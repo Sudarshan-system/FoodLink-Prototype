@@ -1,0 +1,387 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper: Is request authenticated?
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Helper: Is user an admin (via custom claim or verified admin profile)?
+    // Custom claim is set via Firebase Admin SDK.
+    // Why users-doc fallback cannot be abused:
+    // 1. /users/{userId} create rule strictly prevents non-admins from creating any doc with role == 'admin'.
+    // 2. /users/{userId} update rule strictly forbids non-admins from modifying the 'role' field.
+    // 3. Therefore, an attacker can never write role: 'admin' to their document.
+    function isAdmin() {
+      return isAuthenticated() && (
+        ('admin' in request.auth.token && request.auth.token.admin == true) ||
+        (
+          exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'
+        )
+      );
+    }
+
+    // Helper: Is user the owner of the document?
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Helper: Fetch user document data
+    function getUser(uid) {
+      return get(/databases/$(database)/documents/users/$(uid)).data;
+    }
+
+    // Helper: Is user document verified and not expired?
+    function isVerifiedAndNotExpired(userDoc) {
+      return userDoc.verificationStatus == 'verified' && (
+        !(userDoc.verificationExpiryDate is timestamp) ||
+        userDoc.verificationExpiryDate > request.time
+      );
+    }
+
+    // Helper: Is donor verified with active non-expired credential?
+    function isVerifiedDonor() {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        getUser(request.auth.uid).role == 'donor' &&
+        isVerifiedAndNotExpired(getUser(request.auth.uid));
+    }
+
+    // Helper: Is recipient verified with active non-expired credential?
+    function isVerifiedRecipient() {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        getUser(request.auth.uid).role == 'recipient' &&
+        isVerifiedAndNotExpired(getUser(request.auth.uid));
+    }
+
+    // =====================================================================
+    // FOOD SAFETY BENCHMARK CONFIGURATION (FSSAI Safe Food Guidance):
+    // Maximum safe shelf-life window is capped at 6 hours for perishable prepared meals.
+    // NOTE FOR FSSAI AUDIT: Based on FSSAI surplus food regulations for hot/cold holding.
+    // =====================================================================
+    function maxCookedShelfLifeDuration() {
+      return duration.value(6, 'h');
+    }
+
+    // --- USERS COLLECTION ---
+    match /users/{userId} {
+      // Privacy Protection: Only owner and admin can read full profile (avoids leaking phone, address, email)
+      allow read: if isAuthenticated() && (isOwner(userId) || isAdmin());
+
+      // Creating own profile:
+      // Non-admins can only create their own profile (request.auth.uid == userId)
+      // Must NOT be able to set role 'admin' or verificationStatus 'verified'
+      // Only permitted self-selected roles ('donor', 'recipient') and verificationStatus ('unverified', 'pending')
+      // Must NOT include any reviewer or expiry audit fields.
+      allow create: if isAuthenticated() && (
+        isAdmin() ||
+        (
+          isOwner(userId) &&
+          request.resource.data.role in ['donor', 'recipient'] &&
+          request.resource.data.verificationStatus in ['unverified', 'pending'] &&
+          !request.resource.data.keys().hasAny([
+            'reviewedByAdminUid',
+            'reviewedByAdminName',
+            'reviewedAt',
+            'rejectionReason',
+            'verificationExpiryDate',
+            'expiryDate'
+          ])
+        )
+      );
+
+      // Updating profile:
+      // Non-admins CANNOT modify verificationStatus, verificationExpiryDate, role, or audit fields.
+      // Only admins can change verificationStatus, expiry dates, or grant admin role.
+      allow update: if isAuthenticated() && (
+        isAdmin() ||
+        (
+          isOwner(userId) &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'verificationStatus', 
+            'verificationExpiryDate', 
+            'role', 
+            'rejectionReason', 
+            'reviewedByAdminUid', 
+            'reviewedByAdminName',
+            'reviewedAt'
+          ])
+        )
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // Minimal public directory profile for partner matching
+    match /publicProfiles/{userId} {
+      allow read: if isAuthenticated();
+      allow create, update: if isAuthenticated() && (isOwner(userId) || isAdmin());
+      allow delete: if isAdmin();
+    }
+
+    // --- VERIFICATION SUBMISSIONS / DOCUMENTS COLLECTION ---
+    match /verifications/{verificationId} {
+      // Admins can read all verifications; users can read only their own
+      allow read: if isAuthenticated() && (
+        isAdmin() || resource.data.userId == request.auth.uid
+      );
+
+      // Users can submit their verification document:
+      // Must have status == 'pending' and userId == request.auth.uid
+      // Must NOT include any reviewer, rejection reason, or expiry audit fields.
+      allow create: if isAuthenticated() && (
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.status == 'pending' &&
+        !request.resource.data.keys().hasAny([
+          'reviewedByAdminUid',
+          'reviewedByAdminName',
+          'reviewedAt',
+          'rejectionReason',
+          'expiryDate',
+          'verificationExpiryDate'
+        ])
+      );
+
+      // Updating verification document:
+      // 1. Admin Decision (Approve / Reject):
+      //    - Must be admin
+      //    - status in ['verified', 'rejected']
+      //    - reviewedByAdminUid MUST equal request.auth.uid
+      //    - reviewedAt MUST equal request.time
+      //    - If status == 'rejected', rejectionReason is required and non-empty string.
+      // 2. Non-Admin Resubmission:
+      //    - Document owner only
+      //    - Can only set status back to 'pending'
+      //    - Must not touch reviewedBy*, reviewedAt, expiryDate, or userId
+      allow update: if isAuthenticated() && (
+        (
+          isAdmin() &&
+          request.resource.data.status in ['verified', 'rejected'] &&
+          request.resource.data.reviewedByAdminUid == request.auth.uid &&
+          request.resource.data.reviewedAt == request.time &&
+          (
+            request.resource.data.status != 'rejected' ||
+            (
+              'rejectionReason' in request.resource.data &&
+              request.resource.data.rejectionReason is string &&
+              request.resource.data.rejectionReason.size() > 0
+            )
+          )
+        ) ||
+        (
+          resource.data.userId == request.auth.uid &&
+          request.resource.data.userId == request.auth.uid &&
+          request.resource.data.status == 'pending' &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'reviewedByAdminUid',
+            'reviewedByAdminName',
+            'reviewedAt',
+            'expiryDate',
+            'verificationExpiryDate',
+            'userId'
+          ])
+        )
+      );
+
+      allow delete: if isAdmin();
+
+      // Private base64 document attachments subcollection: /verifications/{docId}/attachments/{attachmentId}
+      match /attachments/{attachmentId} {
+        // Read: uploader + admin only
+        allow read: if isAuthenticated() && (
+          isAdmin() ||
+          get(/databases/$(database)/documents/verifications/$(verificationId)).data.userId == request.auth.uid
+        );
+
+        // Create: uploader only, while parent verification is theirs and 'pending'
+        // Capped at 700 KB base64 (716,800 characters)
+        allow create: if isAuthenticated() && (
+          get(/databases/$(database)/documents/verifications/$(verificationId)).data.userId == request.auth.uid &&
+          get(/databases/$(database)/documents/verifications/$(verificationId)).data.status == 'pending' &&
+          request.resource.data.userId == request.auth.uid &&
+          request.resource.data.base64Data is string &&
+          request.resource.data.base64Data.size() <= 716800
+        );
+
+        allow update: if false;
+        allow delete: if isAdmin();
+      }
+    }
+
+    // --- FOOD LISTINGS COLLECTION ---
+    match /listings/{listingId} {
+      // Read: only verified, non-expired recipients, the owning donor, and admins can read active listings (not public)
+      allow read: if isAuthenticated() && (
+        isAdmin() ||
+        resource.data.donorUid == request.auth.uid ||
+        isVerifiedRecipient()
+      );
+
+      // Create:
+      // - Must be verified non-expired donor or admin
+      // - donorUid == request.auth.uid
+      // - status == 'active'
+      // - totalQuantity > 0 and remainingQuantity == totalQuantity
+      // - all 4 safetyDeclaration checks == true
+      // - declaredByUid == request.auth.uid and declaredAt == request.time
+      // - expiresAt > request.time and <= request.time + 6 hours
+      // - pickupWindowEnd <= expiresAt and pickupWindowStart <= pickupWindowEnd
+      allow create: if isAuthenticated() && (
+        (isVerifiedDonor() || isAdmin()) &&
+        request.resource.data.donorUid == request.auth.uid &&
+        request.resource.data.status == 'active' &&
+        request.resource.data.totalQuantity is number &&
+        request.resource.data.totalQuantity > 0 &&
+        request.resource.data.remainingQuantity == request.resource.data.totalQuantity &&
+        request.resource.data.safetyDeclaration.temperatureSafe == true &&
+        request.resource.data.safetyDeclaration.hygienicallyPrepared == true &&
+        request.resource.data.safetyDeclaration.allergensDisclosed == true &&
+        request.resource.data.safetyDeclaration.freshAtListing == true &&
+        request.resource.data.safetyDeclaration.declaredByUid == request.auth.uid &&
+        request.resource.data.safetyDeclaration.declaredAt == request.time &&
+        request.resource.data.expiresAt is timestamp &&
+        request.resource.data.expiresAt > request.time &&
+        request.resource.data.expiresAt <= request.time + maxCookedShelfLifeDuration() &&
+        request.resource.data.pickupWindowEnd is timestamp &&
+        request.resource.data.pickupWindowEnd <= request.resource.data.expiresAt &&
+        request.resource.data.pickupWindowStart is timestamp &&
+        request.resource.data.pickupWindowStart <= request.resource.data.pickupWindowEnd
+      );
+
+      // Update:
+      // Donors can edit/cancel only their own listings and can NEVER modify remainingQuantity, donorUid, or totalQuantity
+      // Verified recipients (or transactions) can modify remainingQuantity ONLY alongside a valid claim or cancellation via getAfter()
+      allow update: if isAuthenticated() && (
+        isAdmin() ||
+        (
+          resource.data.donorUid == request.auth.uid &&
+          request.resource.data.donorUid == request.auth.uid &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['remainingQuantity', 'donorUid', 'totalQuantity'])
+        ) ||
+        (
+          isVerifiedRecipient() &&
+          'lastClaimId' in request.resource.data &&
+          request.resource.data.lastClaimId is string &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+            'donorUid', 'totalQuantity', 'safetyDeclaration', 'expiresAt', 
+            'preparedAt', 'pickupWindowStart', 'pickupWindowEnd', 'coarseLocation'
+          ]) &&
+          // Atomic claim or cancellation verification
+          (
+            // 1. Claim creation: remainingQuantity decreased by afterClaim.quantity
+            (
+              getAfter(/databases/$(database)/documents/claims/$(request.resource.data.lastClaimId)).data.listingId == listingId &&
+              getAfter(/databases/$(database)/documents/claims/$(request.resource.data.lastClaimId)).data.recipientUid == request.auth.uid &&
+              getAfter(/databases/$(database)/documents/claims/$(request.resource.data.lastClaimId)).data.status == 'confirmed' &&
+              request.resource.data.remainingQuantity == resource.data.remainingQuantity - getAfter(/databases/$(database)/documents/claims/$(request.resource.data.lastClaimId)).data.quantity &&
+              request.resource.data.remainingQuantity >= 0
+            ) ||
+            // 2. Claim cancellation: remainingQuantity restored by beforeClaim.quantity
+            (
+              exists(/databases/$(database)/documents/claims/$(request.resource.data.lastClaimId)) &&
+              get(/databases/$(database)/documents/claims/$(request.resource.data.lastClaimId)).data.listingId == listingId &&
+              get(/databases/$(database)/documents/claims/$(request.resource.data.lastClaimId)).data.status == 'confirmed' &&
+              get(/databases/$(database)/documents/claims/$(request.resource.data.lastClaimId)).data.recipientUid == request.auth.uid &&
+              getAfter(/databases/$(database)/documents/claims/$(request.resource.data.lastClaimId)).data.status == 'cancelled' &&
+              request.resource.data.remainingQuantity == resource.data.remainingQuantity + get(/databases/$(database)/documents/claims/$(request.resource.data.lastClaimId)).data.quantity &&
+              request.resource.data.remainingQuantity <= resource.data.totalQuantity
+            )
+          )
+        )
+      );
+
+      allow delete: if isAdmin();
+
+      // Private pickup details subdocument: /listings/{listingId}/private/pickupAddress
+      match /private/{privateDocId} {
+        // Read: owning donor, admins, and confirmed claim recipients only
+        allow read: if isAuthenticated() && (
+          isAdmin() ||
+          get(/databases/$(database)/documents/listings/$(listingId)).data.donorUid == request.auth.uid ||
+          (
+            exists(/databases/$(database)/documents/claims/$(request.auth.uid + '_' + listingId)) &&
+            get(/databases/$(database)/documents/claims/$(request.auth.uid + '_' + listingId)).data.status == 'confirmed'
+          )
+        );
+
+        // Create & Update: owning donor or admin only
+        allow create, update: if isAuthenticated() && (
+          isAdmin() ||
+          get(/databases/$(database)/documents/listings/$(listingId)).data.donorUid == request.auth.uid
+        );
+
+        allow delete: if isAdmin();
+      }
+    }
+
+    // --- CLAIMS COLLECTION ---
+    match /claims/{claimId} {
+      // Read:
+      // - Recipient reads only their own claims
+      // - Donor reads claims on their own listings
+      // - Admins read all
+      allow read: if isAuthenticated() && (
+        isAdmin() ||
+        resource.data.recipientUid == request.auth.uid ||
+        (
+          exists(/databases/$(database)/documents/listings/$(resource.data.listingId)) &&
+          get(/databases/$(database)/documents/listings/$(resource.data.listingId)).data.donorUid == request.auth.uid
+        )
+      );
+
+      // Create:
+      // - recipientUid == request.auth.uid
+      // - isVerifiedRecipient() (verified and not expired)
+      // - listing status == 'active' and request.time < expiresAt
+      // - 0 < quantity <= listing.remainingQuantity
+      // - status == 'confirmed'
+      // - claimedAt == request.time
+      // - getAfter() on listing verifies atomic decrement
+      allow create: if isAuthenticated() &&
+        isVerifiedRecipient() &&
+        request.resource.data.recipientUid == request.auth.uid &&
+        request.resource.data.status == 'confirmed' &&
+        request.resource.data.claimedAt == request.time &&
+        request.resource.data.quantity is number &&
+        request.resource.data.quantity > 0 &&
+        exists(/databases/$(database)/documents/listings/$(request.resource.data.listingId)) &&
+        get(/databases/$(database)/documents/listings/$(request.resource.data.listingId)).data.status == 'active' &&
+        request.time < get(/databases/$(database)/documents/listings/$(request.resource.data.listingId)).data.expiresAt &&
+        request.resource.data.quantity <= get(/databases/$(database)/documents/listings/$(request.resource.data.listingId)).data.remainingQuantity &&
+        getAfter(/databases/$(database)/documents/listings/$(request.resource.data.listingId)).data.remainingQuantity ==
+          get(/databases/$(database)/documents/listings/$(request.resource.data.listingId)).data.remainingQuantity - request.resource.data.quantity;
+
+      // Update:
+      // - Nobody can edit another user's claim: resource.data.recipientUid == request.auth.uid || isAdmin()
+      // - quantity and listingId are immutable:
+      //   request.resource.data.quantity == resource.data.quantity &&
+      //   request.resource.data.listingId == resource.data.listingId &&
+      //   request.resource.data.recipientUid == resource.data.recipientUid
+      // - Cancellation by recipient: status confirmed -> cancelled, atomic restoration via getAfter()
+      allow update: if isAuthenticated() && (
+        isAdmin() ||
+        (
+          resource.data.recipientUid == request.auth.uid &&
+          request.resource.data.recipientUid == resource.data.recipientUid &&
+          request.resource.data.listingId == resource.data.listingId &&
+          request.resource.data.quantity == resource.data.quantity &&
+          (
+            // Cancellation
+            (
+              resource.data.status == 'confirmed' &&
+              request.resource.data.status == 'cancelled' &&
+              request.resource.data.cancelledAt == request.time &&
+              getAfter(/databases/$(database)/documents/listings/$(resource.data.listingId)).data.remainingQuantity ==
+                get(/databases/$(database)/documents/listings/$(resource.data.listingId)).data.remainingQuantity + resource.data.quantity
+            )
+          )
+        )
+      );
+
+      allow delete: if isAdmin();
+    }
+  }
+}
