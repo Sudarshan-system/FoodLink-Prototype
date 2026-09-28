@@ -1,32 +1,42 @@
-# React + TypeScript + Vite
+# FoodLink
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+FoodLink is a community-driven food sharing and donation platform designed to connect donors, recipients, and administrators in a simple and accessible way.
 
-Currently, two official plugins are available:
+## Direct access
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- GitHub repository: https://github.com/Sudarshan-system/FoodLink-Prototype
+- Project live access: use the app in your local dev environment by running the project with Vite, or deploy it to your preferred hosting service.
 
-## React Compiler
+## Overview
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+This project helps streamline:
 
-## Expanding the Oxlint configuration
+- food listings and donation requests
+- donor and recipient dashboards
+- admin review workflows
+- Firebase-powered authentication and data storage
+- secure verification and listing management flows
 
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
+## Getting started
 
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```bash
+npm install
+npm run dev
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+Then open the local URL shown in the terminal, usually:
+
+```text
+http://localhost:5173
+```
+
+## Tech stack
+
+- React + TypeScript
+- Vite
+- Tailwind CSS
+- Firebase
+
+## Project status
+
+This repository is currently set up for active development and collaboration.
